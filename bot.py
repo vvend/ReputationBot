@@ -7,12 +7,12 @@ import os
 import csv
 import io
 
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery, FSInputFile
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram import Bot, Dispatcher, types
+from aiogram.contrib.middlewares.logging import LoggingMiddleware
+from aiogram.types import Message, ContentType, InputFile
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from supabase import create_client, Client
 import pytz
 from aiohttp import web
@@ -21,28 +21,30 @@ from aiohttp import web
 BOT_TOKEN = "8759395470:AAG32n7rCOPan3CpLB1J5baQkdMqpWcXM0I"
 SUPABASE_URL = "https://nykmpappwhuurdopmqkp.supabase.co"
 SUPABASE_KEY = "sb_publishable_C1ZcZc41DIO7DmDXuj-EmA_uRsOSdX8"
-ADMINS = [8578766646, 910694395, 8175540104, 7957758473]
-ALLOWED_CHAT_ID = -1003995270858
-TIMEZONE = "Europe/Moscow"
-CHAT_NAME = "ТОчат"
-VERIFIED_THRESHOLD = 50
+ADMINS = [8578766646, 910694395, 8175540104, 7957758473]  # твой ID + модеры
+ALLOWED_CHAT_ID = -1003995270858  # только этот чат работает
+TIMEZONE = "Europe/Moscow"  # Москва
+CHAT_NAME = "ТОчат"  # для фразы "Репутация в ТОчат у @"
+VERIFIED_THRESHOLD = 50  # разница плюс-минус >50 → проверенный
 MAX_FILES_APPEAL = 10
 APPEAL_TIMEOUT_MINUTES = 120
-ALLOWED_DOMAINS = []
+ALLOWED_DOMAINS = []  # оставь пустым для блокировки всех ссылок
 # =============================================
-
-bot = Bot(token=BOT_TOKEN)
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-tz = pytz.timezone(TIMEZONE)
 
 logging.basicConfig(level=logging.INFO)
 
+bot = Bot(token=BOT_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(bot, storage=storage)
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+tz = pytz.timezone(TIMEZONE)
+
+# ========== FSM для апелляции ==========
 class AppealState(StatesGroup):
     waiting_for_text = State()
     waiting_for_files = State()
 
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 def is_admin(user_id: int) -> bool:
     return user_id in ADMINS
 
@@ -81,7 +83,7 @@ def update_user_rep(username: str, delta_plus: int, delta_minus: int):
         "last_active": datetime.now(tz).isoformat()
     }).eq("username", username).execute()
 
-def set_verified_status(username: str, by_admin: bool = False, admin_username: str = None):
+def set_verified_status(username: str, by_admin: bool = False):
     current_plus, current_minus, _, _, _ = get_user_rep(username)
     diff = current_plus - current_minus
     if diff >= VERIFIED_THRESHOLD:
@@ -96,7 +98,7 @@ def celebrate_user(username: str, user_id: int):
     _, _, celebrated, _, _ = get_user_rep(username)
     if not celebrated:
         try:
-            photo = FSInputFile("celebrate.jpg")
+            photo = InputFile("celebrate.jpg")
             asyncio.create_task(bot.send_photo(
                 chat_id=ALLOWED_CHAT_ID,
                 photo=photo,
@@ -258,7 +260,8 @@ async def process_vote(message: Message, is_plus: bool, reason: str = ""):
     if target_user and target_user.id:
         await notify_user(target_user.id, f"📢 Вам поставил {action_text} {get_display_name(giver.username, giver.id)}\nТекущая репутация: 👍{plus} 👎{minus}")
 
-@dp.message(F.text & (F.text.lower().startswith("+реп") | F.text.lower().startswith("+rep")))
+# ========== Aiogram 2.x Handlers ==========
+@dp.message_handler(lambda message: message.text and (message.text.lower().startswith("+реп") or message.text.lower().startswith("+rep")))
 async def plus_rep(message: Message):
     reason = ""
     text = message.text
@@ -269,7 +272,7 @@ async def plus_rep(message: Message):
             reason = rest[1]
     await process_vote(message, True, reason)
 
-@dp.message(F.text & (F.text.lower().startswith("-реп") | F.text.lower().startswith("-rep")))
+@dp.message_handler(lambda message: message.text and (message.text.lower().startswith("-реп") or message.text.lower().startswith("-rep")))
 async def minus_rep(message: Message):
     reason = ""
     text = message.text
@@ -280,7 +283,7 @@ async def minus_rep(message: Message):
             reason = rest[1]
     await process_vote(message, False, reason)
 
-@dp.message(F.text & (F.text.lower().startswith("+++реп") | F.text.lower().startswith("+++rep")))
+@dp.message_handler(lambda message: message.text and (message.text.lower().startswith("+++реп") or message.text.lower().startswith("+++rep")))
 async def mass_plus(message: Message):
     if not is_main_admin(message.from_user.id):
         await message.reply("❌ Только главный администратор может использовать эту команду")
@@ -314,7 +317,7 @@ async def mass_plus(message: Message):
     if (plus - minus) >= VERIFIED_THRESHOLD and not celebrated:
         celebrate_user(target, 0)
 
-@dp.message(F.text & (F.text.lower().startswith("---реп") | F.text.lower().startswith("---rep")))
+@dp.message_handler(lambda message: message.text and (message.text.lower().startswith("---реп") or message.text.lower().startswith("---rep")))
 async def mass_minus(message: Message):
     if not is_main_admin(message.from_user.id):
         await message.reply("❌ Только главный администратор может использовать эту команду")
@@ -344,7 +347,7 @@ async def mass_minus(message: Message):
     log_admin_action(message.from_user.username or str(message.from_user.id), "mass_minus", target, f"{amount}")
     await message.reply(f"✅ Выдано {amount} минусов пользователю @{target}")
 
-@dp.message(F.text & (F.text.lower().startswith("инфо") | F.text.lower().startswith("info")))
+@dp.message_handler(lambda message: message.text and (message.text.lower().startswith("инфо") or message.text.lower().startswith("info")))
 async def info_command(message: Message):
     if message.chat.id != ALLOWED_CHAT_ID:
         return
@@ -391,14 +394,14 @@ async def info_command(message: Message):
         emoji = "👍" if v["vote"] == 1 else "👎"
         giver_display = "Админ" if v["giver"] == "admin_gift" else v["giver"]
         reason_text = f" ➞ {v['reason']}" if v.get("reason") else ""
-        date = datetime.fromisoformat(v["created_at"]).astimezone(tz).strftime("%d.%m %H:%M")
-        feedback_lines.append(f"{i}) {emoji} от {giver_display} ({date}){reason_text}")
+        date_str = datetime.fromisoformat(v["created_at"]).astimezone(tz).strftime("%d.%m %H:%M")
+        feedback_lines.append(f"{i}) {emoji} от {giver_display} ({date_str}){reason_text}")
     if not feedback_lines:
         feedback_lines = ["Нет оценок"]
     
     await message.reply(f"{header}{verified_line}\n👍 Плюсы: {plus}\n👎 Минусы: {minus}\n\n📝 Последние 3 оценки:\n" + "\n".join(feedback_lines))
 
-@dp.message(Command("history"))
+@dp.message_handler(commands=["history"])
 async def history_command(message: Message):
     if message.chat.id != ALLOWED_CHAT_ID:
         return
@@ -427,17 +430,17 @@ async def history_command(message: Message):
             if v["giver"] == "admin_gift":
                 continue
             emoji = "👍" if v["vote"] == 1 else "👎"
-            date = datetime.fromisoformat(v["created_at"]).astimezone(tz).strftime("%d.%m %H:%M")
-            out.append(f"  {emoji} от {v['giver']} ({date})")
+            date_str = datetime.fromisoformat(v["created_at"]).astimezone(tz).strftime("%d.%m %H:%M")
+            out.append(f"  {emoji} от {v['giver']} ({date_str})")
     if given.data:
         out.append("\n📤 Поставил:")
         for v in given.data[:5]:
             emoji = "👍" if v["vote"] == 1 else "👎"
-            date = datetime.fromisoformat(v["created_at"]).astimezone(tz).strftime("%d.%m %H:%M")
-            out.append(f"  {emoji} пользователю {v['receiver']} ({date})")
+            date_str = datetime.fromisoformat(v["created_at"]).astimezone(tz).strftime("%d.%m %H:%M")
+            out.append(f"  {emoji} пользователю {v['receiver']} ({date_str})")
     await message.reply("\n".join(out))
 
-@dp.message(Command("top"))
+@dp.message_handler(commands=["top"])
 async def top_command(message: Message):
     if message.chat.id != ALLOWED_CHAT_ID:
         return
@@ -452,7 +455,7 @@ async def top_command(message: Message):
         lines.append(f"{i}. {u} — {diff}")
     await message.reply("\n".join(lines))
 
-@dp.message(Command(commands=["проверенные", "verified"]))
+@dp.message_handler(commands=["проверенные", "verified"])
 async def verified_list(message: Message):
     if message.chat.id != ALLOWED_CHAT_ID:
         return
@@ -473,7 +476,7 @@ async def verified_list(message: Message):
 
 appeal_data = {}
 
-@dp.message(Command(commands=["ap", "ап"]))
+@dp.message_handler(commands=["ap", "ап"])
 async def start_appeal(message: Message, state: FSMContext):
     if message.chat.id != ALLOWED_CHAT_ID:
         return
@@ -481,7 +484,7 @@ async def start_appeal(message: Message, state: FSMContext):
         await message.reply("❌ Ответьте на сообщение с оценкой, которую хотите оспорить")
         return
     original = message.reply_to_message
-    if not original.text or not (original.text.startswith("-реп") or original.text.startswith("-rep")):
+        if not original.text or not (original.text.startswith("-реп") or original.text.startswith("-rep")):
         await message.reply("❌ Оспорить можно только отрицательную оценку (-реп)")
         return
     appeal_data[message.from_user.id] = {
@@ -491,10 +494,10 @@ async def start_appeal(message: Message, state: FSMContext):
     await message.reply("📝 Опишите ситуацию и приложите доказательства.\nНапишите текст апелляции:")
     await state.set_state(AppealState.waiting_for_text)
 
-@dp.message(AppealState.waiting_for_text)
+@dp.message_handler(state=AppealState.waiting_for_text)
 async def appeal_text(message: Message, state: FSMContext):
     if message.text.startswith("/"):
-        await state.clear()
+        await state.finish()
         await message.reply("❌ Апелляция отменена")
         return
     await state.update_data(text=message.text)
@@ -503,7 +506,7 @@ async def appeal_text(message: Message, state: FSMContext):
     appeal_data[message.from_user.id] = appeal_data.get(message.from_user.id, {})
     appeal_data[message.from_user.id]["files"] = []
 
-@dp.message(AppealState.waiting_for_files, F.document | F.photo | F.video)
+@dp.message_handler(content_types=[ContentType.DOCUMENT, ContentType.PHOTO, ContentType.VIDEO], state=AppealState.waiting_for_files)
 async def appeal_files(message: Message, state: FSMContext):
     files = appeal_data.get(message.from_user.id, {}).get("files", [])
     if len(files) >= MAX_FILES_APPEAL:
@@ -521,7 +524,7 @@ async def appeal_files(message: Message, state: FSMContext):
         appeal_data[message.from_user.id]["files"] = files
         await message.reply(f"Файл добавлен ({len(files)}/{MAX_FILES_APPEAL})")
 
-@dp.message(Command("done"), AppealState.waiting_for_files)
+@dp.message_handler(commands=["done"], state=AppealState.waiting_for_files)
 async def appeal_done(message: Message, state: FSMContext):
     data = await state.get_data()
     text = data.get("text")
@@ -530,7 +533,7 @@ async def appeal_done(message: Message, state: FSMContext):
     giver = appeal_data.get(message.from_user.id, {}).get("giver")
     if not text:
         await message.reply("❌ Ошибка, начните заново /ap")
-        await state.clear()
+        await state.finish()
         return
     supabase.table("appeals").insert({
         "receiver": receiver,
@@ -546,9 +549,9 @@ async def appeal_done(message: Message, state: FSMContext):
         except:
             pass
     await message.reply("✅ Апелляция отправлена на рассмотрение")
-    await state.clear()
+    await state.finish()
 
-@dp.message(Command(commands=["?реп", "?rep"]))
+@dp.message_handler(commands=["?реп", "?rep"])
 async def ban_user(message: Message):
     if not is_admin(message.from_user.id):
         return
@@ -560,7 +563,7 @@ async def ban_user(message: Message):
     log_admin_action(message.from_user.username or str(message.from_user.id), "ban", arg)
     await message.reply(f"✅ Пользователь {arg} забанен")
 
-@dp.message(Command(commands=["!реп", "!rep"]))
+@dp.message_handler(commands=["!реп", "!rep"])
 async def unban_user(message: Message):
     if not is_admin(message.from_user.id):
         return
@@ -572,7 +575,7 @@ async def unban_user(message: Message):
     log_admin_action(message.from_user.username or str(message.from_user.id), "unban", arg)
     await message.reply(f"✅ Пользователь {arg} разбанен")
 
-@dp.message(Command(commands=["++реп", "++rep"]))
+@dp.message_handler(commands=["++реп", "++rep"])
 async def remove_plus(message: Message):
     if not is_admin(message.from_user.id):
         return
@@ -588,7 +591,7 @@ async def remove_plus(message: Message):
     log_admin_action(message.from_user.username or str(message.from_user.id), "remove_plus", arg)
     await message.reply(f"✅ Удален один плюс у {arg}. Теперь: 👍{plus-1} 👎{minus}")
 
-@dp.message(Command(commands=["--реп", "--rep"]))
+@dp.message_handler(commands=["--реп", "--rep"])
 async def remove_minus(message: Message):
     if not is_admin(message.from_user.id):
         return
@@ -604,7 +607,7 @@ async def remove_minus(message: Message):
     log_admin_action(message.from_user.username or str(message.from_user.id), "remove_minus", arg)
     await message.reply(f"✅ Удален один минус у {arg}. Теперь: 👍{plus} 👎{minus-1}")
 
-@dp.message(Command("reset_limits"))
+@dp.message_handler(commands=["reset_limits"])
 async def reset_limits(message: Message):
     if not is_admin(message.from_user.id):
         return
@@ -612,7 +615,7 @@ async def reset_limits(message: Message):
     await message.reply("✅ Суточные лимиты сброшены для всех пользователей")
     log_admin_action(message.from_user.username or str(message.from_user.id), "reset_all_limits")
 
-@dp.message(Command("export"))
+@dp.message_handler(commands=["export"])
 async def export_csv(message: Message):
     if not is_main_admin(message.from_user.id):
         return
@@ -623,9 +626,9 @@ async def export_csv(message: Message):
     for u in resp.data:
         writer.writerow([u["username"], u["plus_count"], u["minus_count"], u["plus_count"] - u["minus_count"]])
     output.seek(0)
-    await message.reply_document(FSInputFile(io.BytesIO(output.getvalue().encode()), filename="reputation_export.csv"))
+    await message.reply_document(InputFile(io.BytesIO(output.getvalue().encode()), filename="reputation_export.csv"))
 
-@dp.message(F.chat.id == ALLOWED_CHAT_ID)
+@dp.message_handler(content_types=ContentType.TEXT, chat_id=ALLOWED_CHAT_ID)
 async def block_links(message: Message):
     if message.text and (message.text.startswith(('/', '+', '-', '!', '?')) or message.text.startswith(('+++', '---'))):
         return
@@ -633,8 +636,9 @@ async def block_links(message: Message):
         return
     if message.text and contains_forbidden_link(message.text):
         await message.delete()
-        await message.answer(f"❌ @{message.from_user.username or message.from_user.id}, ссылки запрещены", delete_in_seconds=5)
+        await message.answer(f"❌ @{message.from_user.username or message.from_user.id}, ссылки запрещены", disable_notification=True)
 
+# ========== АВТОПИНГ (HTTP-сервер для Render) ==========
 async def health_check(request):
     return web.Response(text="OK")
 
@@ -647,9 +651,11 @@ async def start_web():
     await site.start()
     logging.info("Web server started on port 8080 for pings")
 
+# ========== ЗАПУСК ==========
 async def main():
     asyncio.create_task(start_web())
-    await dp.start_polling(bot)
+    from aiogram import executor
+    executor.start_polling(dp, skip_updates=True)
 
 if __name__ == "__main__":
     asyncio.run(main())
