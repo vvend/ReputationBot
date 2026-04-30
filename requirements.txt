@@ -1,0 +1,5 @@
+aiogram==3.17.0
+supabase==2.15.0
+pytz==2024.2
+aiohttp==3.11.0
+python-dotenv==1.0.0
