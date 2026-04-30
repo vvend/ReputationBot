@@ -24,17 +24,29 @@ appeal_temp = {}
 def supabase_req(method, table, params=None, data=None):
     url = f"{SUPABASE_URL}/rest/v1/{table}"
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json"}
-    if method == "GET":
-        r = requests.get(url, headers=headers, params=params)
-    elif method == "POST":
-        r = requests.post(url, headers=headers, json=data)
-    elif method == "DELETE":
-        r = requests.delete(url, headers=headers, params=params)
-    elif method == "PATCH":
-        r = requests.patch(url, headers=headers, json=data, params=params)
-    else:
+    try:
+        if method == "GET":
+            r = requests.get(url, headers=headers, params=params)
+        elif method == "POST":
+            r = requests.post(url, headers=headers, json=data)
+        elif method == "DELETE":
+            r = requests.delete(url, headers=headers, params=params)
+        elif method == "PATCH":
+            r = requests.patch(url, headers=headers, json=data, params=params)
+        else:
+            return None
+        
+        # Если ответ пустой (204 No Content) — возвращаем пустой список
+        if r.status_code == 204 or not r.text.strip():
+            return []
+        
+        # Пробуем распарсить JSON
+        if r.status_code in [200, 201]:
+            return r.json()
         return None
-    return r.json() if r.status_code in [200, 201] else None
+    except Exception as e:
+        print(f"Supabase error: {e}, status: {r.status_code if 'r' in locals() else 'unknown'}")
+        return None
 
 def send_msg(chat_id, text, reply_to=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
