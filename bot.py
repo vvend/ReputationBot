@@ -19,7 +19,6 @@ VERIFIED_THRESHOLD = 50
 
 tz = pytz.timezone(TIMEZONE)
 user_cooldown = {}
-appeal_temp = {}
 
 def supabase_req(method, table, params=None, data=None):
     url = f"{SUPABASE_URL}/rest/v1/{table}"
@@ -35,17 +34,13 @@ def supabase_req(method, table, params=None, data=None):
             r = requests.patch(url, headers=headers, json=data, params=params)
         else:
             return None
-        
-        # Если ответ пустой (204 No Content) — возвращаем пустой список
         if r.status_code == 204 or not r.text.strip():
             return []
-        
-        # Пробуем распарсить JSON
         if r.status_code in [200, 201]:
             return r.json()
         return None
     except Exception as e:
-        print(f"Supabase error: {e}, status: {r.status_code if 'r' in locals() else 'unknown'}")
+        print(f"Supabase error: {e}")
         return None
 
 def send_msg(chat_id, text, reply_to=None):
@@ -55,74 +50,51 @@ def send_msg(chat_id, text, reply_to=None):
         data["reply_to_message_id"] = reply_to
     requests.post(url, json=data)
 
-def send_photo(chat_id, caption, reply_to=None):
-    """Отправка картинки (если есть)"""
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-        data = {"chat_id": chat_id, "caption": caption}
-        if reply_to:
-            data["reply_to_message_id"] = reply_to
-        # Пробуем отправить без фото (только текст)
-        send_msg(chat_id, caption, reply_to)
-    except:
-        send_msg(chat_id, caption, reply_to)
-
 def get_username(user):
     return f"@{user['username']}" if user.get("username") else f"id{user['id']}"
 
 def get_user_rep(username):
+    """Возвращает (plus_count, minus_count)"""
     r = supabase_req("GET", "users", params={"username": f"eq.{username}"})
     if r and len(r) > 0:
-        return r[0].get("plus_count", 0), r[0].get("minus_count", 0), r[0].get("celebrated", False)
-    return 0, 0, False
+        return r[0].get("plus_count", 0), r[0].get("minus_count", 0)
+    return 0, 0
 
 def update_user_rep(username, delta_plus, delta_minus):
-    exists = supabase_req("GET", "users", params={"username": f"eq.{username}"})
-    if not exists or len(exists) == 0:
-        supabase_req("POST", "users", data={"username": username, "plus_count": 0, "minus_count": 0})
-    plus, minus, _ = get_user_rep(username)
+    """Обновляет счётчики пользователя"""
+    # Проверяем, существует ли пользователь
+    existing = supabase_req("GET", "users", params={"username": f"eq.{username}"})
+    if not existing or len(existing) == 0:
+        # Создаём нового пользователя
+        supabase_req("POST", "users", data={
+            "username": username,
+            "plus_count": 0,
+            "minus_count": 0,
+            "last_active": datetime.now(tz).isoformat()
+        })
+        existing_plus, existing_minus = 0, 0
+    else:
+        existing_plus = existing[0].get("plus_count", 0)
+        existing_minus = existing[0].get("minus_count", 0)
+    
+    # Обновляем счётчики
+    new_plus = existing_plus + delta_plus
+    new_minus = existing_minus + delta_minus
     supabase_req("PATCH", "users", params={"username": f"eq.{username}"}, data={
-        "plus_count": plus + delta_plus,
-        "minus_count": minus + delta_minus,
+        "plus_count": new_plus,
+        "minus_count": new_minus,
         "last_active": datetime.now(tz).isoformat()
     })
-
-def set_verified_status(username, by_admin=False):
-    plus, minus, _ = get_user_rep(username)
-    if plus - minus >= VERIFIED_THRESHOLD:
-        supabase_req("PATCH", "users", params={"username": f"eq.{username}"}, data={
-            "verified_at": datetime.now(tz).isoformat(),
-            "verified_by": "admin" if by_admin else "auto"
-        })
-        return True
-    return False
-
-def celebrate_user(username):
-    _, _, celebrated = get_user_rep(username)
-    if not celebrated:
-        send_msg(ALLOWED_CHAT_ID, f"🎉 В {CHAT_NAME} новый проверенный пользователь {username} (+{VERIFIED_THRESHOLD})")
-        supabase_req("PATCH", "users", params={"username": f"eq.{username}"}, data={"celebrated": True})
 
 def is_banned(username):
     r = supabase_req("GET", "bans", params={"username": f"eq.{username}"})
     return r and len(r) > 0
 
-def can_change_vote(giver, receiver):
-    today = datetime.now(tz).date().isoformat()
-    r = supabase_req("GET", "vote_changes", params={"giver": f"eq.{giver}", "receiver": f"eq.{receiver}"})
-    if not r or len(r) == 0:
-        return True
-    return r[0].get("last_change_date") != today
-
-def record_vote_change(giver, receiver):
-    today = datetime.now(tz).date().isoformat()
-    supabase_req("POST", "vote_changes", data={"giver": giver, "receiver": receiver, "last_change_date": today})
-
 def get_target_from_message(msg):
     if "reply_to_message" in msg:
         return msg["reply_to_message"]["from"]
     text = msg.get("text", "")
-    match = re.search(r'@(\w+)', text)
+    match = re.search(r'@([a-zA-Z0-9_]+)', text)
     if match:
         return {"username": match.group(1), "id": 0}
     return None
@@ -141,20 +113,6 @@ def parse_amount_and_target(text):
         return None, None
     except:
         return None, None
-
-def get_last_3_reviews(username):
-    votes = supabase_req("GET", "votes", params={"receiver": f"eq.{username}", "order": "created_at.desc", "limit": "10"})
-    if not votes:
-        return []
-    unique = []
-    seen = set()
-    for v in votes:
-        if v["giver"] not in seen and v["giver"] != "admin_gift":
-            seen.add(v["giver"])
-            unique.append(v)
-            if len(unique) == 3:
-                break
-    return unique
 
 app = Flask(__name__)
 
@@ -196,11 +154,13 @@ def webhook():
             send_msg(chat_id, "❌ Вы забанены", reply_to=msg["message_id"])
             return "OK", 200
         
+        # Проверяем, голосовал ли уже
         existing = supabase_req("GET", "votes", params={"giver": f"eq.{giver_name}", "receiver": f"eq.{target_name}"})
         if existing and len(existing) > 0:
             send_msg(chat_id, "❌ Вы уже оценили этого пользователя", reply_to=msg["message_id"])
             return "OK", 200
         
+        # Записываем голос
         supabase_req("POST", "votes", data={
             "giver": giver_name,
             "receiver": target_name,
@@ -208,15 +168,15 @@ def webhook():
             "created_at": datetime.now(tz).isoformat()
         })
         
-        old_plus, old_minus, _ = get_user_rep(target_name)
+        # Обновляем репутацию
         update_user_rep(target_name, 1, 0)
-        plus, minus, _ = get_user_rep(target_name)
-        
-        if plus - minus >= VERIFIED_THRESHOLD and old_plus - old_minus < VERIFIED_THRESHOLD:
-            set_verified_status(target_name)
-            celebrate_user(target_name)
+        plus, minus = get_user_rep(target_name)
         
         send_msg(chat_id, f"✅ +реп {target_name}\n👍 {plus} | 👎 {minus}", reply_to=msg["message_id"])
+        
+        # Проверка на проверенного пользователя
+        if plus - minus >= VERIFIED_THRESHOLD:
+            send_msg(ALLOWED_CHAT_ID, f"🎉 {target_name} достиг {VERIFIED_THRESHOLD}+ и стал проверенным пользователем!")
     
     # ========== -РЕП ==========
     elif text.startswith("-реп") or text.startswith("-rep"):
@@ -247,14 +207,6 @@ def webhook():
             send_msg(chat_id, "❌ Вы уже поставили минус этому пользователю", reply_to=msg["message_id"])
             return "OK", 200
         
-        if existing and len(existing) > 0 and existing[0]["vote"] == 1:
-            if not can_change_vote(giver_name, target_name):
-                send_msg(chat_id, "❌ Менять оценку можно раз в сутки", reply_to=msg["message_id"])
-                return "OK", 200
-            supabase_req("DELETE", "votes", params={"giver": f"eq.{giver_name}", "receiver": f"eq.{target_name}"})
-            update_user_rep(target_name, -1, 0)
-            record_vote_change(giver_name, target_name)
-        
         supabase_req("POST", "votes", data={
             "giver": giver_name,
             "receiver": target_name,
@@ -263,7 +215,7 @@ def webhook():
         })
         
         update_user_rep(target_name, 0, 1)
-        plus, minus, _ = get_user_rep(target_name)
+        plus, minus = get_user_rep(target_name)
         send_msg(chat_id, f"❌ -реп {target_name}\n👍 {plus} | 👎 {minus}", reply_to=msg["message_id"])
     
     # ========== ИНФО ==========
@@ -272,63 +224,24 @@ def webhook():
         if not target:
             target = msg["from"]
         username = target.get("username") or f"id{target['id']}"
-        plus, minus, _ = get_user_rep(username)
+        plus, minus = get_user_rep(username)
         diff = plus - minus
         verified = diff >= VERIFIED_THRESHOLD
         
-        verified_line = ""
-        if verified:
-            user_data = supabase_req("GET", "users", params={"username": f"eq.{username}"})
-            if user_data and len(user_data) > 0:
-                verified_at = user_data[0].get("verified_at")
-                verified_by = user_data[0].get("verified_by")
-                if verified_at:
-                    date = datetime.fromisoformat(verified_at).astimezone(tz).strftime("%d.%m.%Y")
-                    if verified_by == "admin":
-                        verified_line = f"\n🏅 Статус выдан администратором ({date})"
-                    else:
-                        verified_line = f"\n🏅 Статус достигнут автоматически ({date})"
+        # Получаем последние 3 оценки
+        votes = supabase_req("GET", "votes", params={"receiver": f"eq.{username}", "order": "created_at.desc", "limit": "3"})
+        reviews_text = []
+        if votes:
+            for i, v in enumerate(votes, 1):
+                emoji = "👍" if v["vote"] == 1 else "👎"
+                giver_display = "Админ" if v["giver"] == "admin_gift" else v["giver"]
+                date = datetime.fromisoformat(v["created_at"]).astimezone(tz).strftime("%d.%m %H:%M")
+                reviews_text.append(f"{i}) {emoji} от {giver_display} ({date})")
         
         header = f"✅ Проверенный пользователь: {username}" if verified else f"📊 Репутация в {CHAT_NAME} у {username}"
-        
-        last_reviews = get_last_3_reviews(username)
-        reviews_text = []
-        for i, v in enumerate(last_reviews, 1):
-            emoji = "👍" if v["vote"] == 1 else "👎"
-            giver_display = "Админ" if v["giver"] == "admin_gift" else v["giver"]
-            date = datetime.fromisoformat(v["created_at"]).astimezone(tz).strftime("%d.%m %H:%M")
-            reviews_text.append(f"{i}) {emoji} от {giver_display} ({date})")
-        
-        result = f"{header}{verified_line}\n👍 Плюсы: {plus}\n👎 Минусы: {minus}\n\n📝 Последние 3 оценки:\n"
+        result = f"{header}\n👍 Плюсы: {plus}\n👎 Минусы: {minus}\n\n📝 Последние 3 оценки:\n"
         result += "\n".join(reviews_text) if reviews_text else "Нет оценок"
         send_msg(chat_id, result, reply_to=msg["message_id"])
-    
-    # ========== ИСТОРИЯ ==========
-    elif text == "история" or text == "/history":
-        target = get_target_from_message(msg)
-        if not target:
-            target = msg["from"]
-        username = target.get("username") or f"id{target['id']}"
-        
-        received = supabase_req("GET", "votes", params={"receiver": f"eq.{username}", "order": "created_at.desc", "limit": "5"})
-        given = supabase_req("GET", "votes", params={"giver": f"eq.{username}", "order": "created_at.desc", "limit": "5"})
-        
-        out = [f"📜 История для {username}:"]
-        if received:
-            out.append("\n📥 Получил:")
-            for v in received:
-                if v["giver"] == "admin_gift":
-                    continue
-                emoji = "👍" if v["vote"] == 1 else "👎"
-                date = datetime.fromisoformat(v["created_at"]).astimezone(tz).strftime("%d.%m %H:%M")
-                out.append(f"  {emoji} от {v['giver']} ({date})")
-        if given:
-            out.append("\n📤 Поставил:")
-            for v in given:
-                emoji = "👍" if v["vote"] == 1 else "👎"
-                date = datetime.fromisoformat(v["created_at"]).astimezone(tz).strftime("%d.%m %H:%M")
-                out.append(f"  {emoji} пользователю {v['receiver']} ({date})")
-        send_msg(chat_id, "\n".join(out), reply_to=msg["message_id"])
     
     # ========== ТОП ==========
     elif text == "топ" or text == "/top":
@@ -355,6 +268,33 @@ def webhook():
             else:
                 send_msg(chat_id, "❌ Нет проверенных пользователей")
     
+    # ========== ИСТОРИЯ ==========
+    elif text == "история" or text == "/history":
+        target = get_target_from_message(msg)
+        if not target:
+            target = msg["from"]
+        username = target.get("username") or f"id{target['id']}"
+        
+        received = supabase_req("GET", "votes", params={"receiver": f"eq.{username}", "order": "created_at.desc", "limit": "5"})
+        given = supabase_req("GET", "votes", params={"giver": f"eq.{username}", "order": "created_at.desc", "limit": "5"})
+        
+        out = [f"📜 История для {username}:"]
+        if received:
+            out.append("\n📥 Получил:")
+            for v in received:
+                if v.get("giver") == "admin_gift":
+                    continue
+                emoji = "👍" if v["vote"] == 1 else "👎"
+                date = datetime.fromisoformat(v["created_at"]).astimezone(tz).strftime("%d.%m %H:%M")
+                out.append(f"  {emoji} от {v['giver']} ({date})")
+        if given:
+            out.append("\n📤 Поставил:")
+            for v in given:
+                emoji = "👍" if v["vote"] == 1 else "👎"
+                date = datetime.fromisoformat(v["created_at"]).astimezone(tz).strftime("%d.%m %H:%M")
+                out.append(f"  {emoji} пользователю {v['receiver']} ({date})")
+        send_msg(chat_id, "\n".join(out), reply_to=msg["message_id"])
+    
     # ========== БАН / РАЗБАН ==========
     elif text.startswith("?реп") or text.startswith("?rep"):
         if user_id not in ADMINS:
@@ -380,7 +320,7 @@ def webhook():
         supabase_req("DELETE", "bans", params={"username": f"eq.{username}"})
         send_msg(chat_id, f"✅ Пользователь {username} разбанен")
     
-    # ========== ++РЕП (удалить один плюс) ==========
+    # ========== ++РЕП / --РЕП ==========
     elif text.startswith("++реп") or text.startswith("++rep"):
         if user_id not in ADMINS:
             send_msg(chat_id, "❌ Нет прав")
@@ -390,15 +330,14 @@ def webhook():
             send_msg(chat_id, "❌ Укажите @username")
             return "OK", 200
         username = target.get("username") or f"id{target['id']}"
-        plus, minus, _ = get_user_rep(username)
+        plus, minus = get_user_rep(username)
         if plus == 0:
             send_msg(chat_id, "❌ У пользователя нет плюсов")
             return "OK", 200
         update_user_rep(username, -1, 0)
-        new_plus, new_minus, _ = get_user_rep(username)
+        new_plus, new_minus = get_user_rep(username)
         send_msg(chat_id, f"✅ Удален один плюс у {username}\n👍 {new_plus} | 👎 {new_minus}")
     
-    # ========== --РЕП (удалить один минус) ==========
     elif text.startswith("--реп") or text.startswith("--rep"):
         if user_id not in ADMINS:
             send_msg(chat_id, "❌ Нет прав")
@@ -408,15 +347,15 @@ def webhook():
             send_msg(chat_id, "❌ Укажите @username")
             return "OK", 200
         username = target.get("username") or f"id{target['id']}"
-        plus, minus, _ = get_user_rep(username)
+        plus, minus = get_user_rep(username)
         if minus == 0:
             send_msg(chat_id, "❌ У пользователя нет минусов")
             return "OK", 200
         update_user_rep(username, 0, -1)
-        new_plus, new_minus, _ = get_user_rep(username)
+        new_plus, new_minus = get_user_rep(username)
         send_msg(chat_id, f"✅ Удален один минус у {username}\n👍 {new_plus} | 👎 {new_minus}")
     
-    # ========== +++РЕП (массовая выдача плюсов, только главный админ) ==========
+    # ========== +++РЕП / ---РЕП (только главный админ) ==========
     elif text.startswith("+++реп") or text.startswith("+++rep"):
         if user_id != MAIN_ADMIN:
             send_msg(chat_id, "❌ Только главный администратор")
@@ -429,16 +368,12 @@ def webhook():
             "giver": "admin_gift",
             "receiver": target,
             "vote": 1,
-            "reason": f"Админ выдал {amount}+",
             "created_at": datetime.now(tz).isoformat()
         })
         update_user_rep(target, amount, 0)
-        set_verified_status(target, by_admin=True)
-        celebrate_user(target)
-        plus, minus, _ = get_user_rep(target)
-        send_msg(chat_id, f"✅ Выдано {amount} плюсов пользователю @{target}\n👍 {plus} | 👎 {minus}")
+        plus, minus = get_user_rep(target)
+        send_msg(chat_id, f"✅ Выдано {amount} плюсов @{target}\n👍 {plus} | 👎 {minus}")
     
-    # ========== ---РЕП (массовая выдача минусов, только главный админ) ==========
     elif text.startswith("---реп") or text.startswith("---rep"):
         if user_id != MAIN_ADMIN:
             send_msg(chat_id, "❌ Только главный администратор")
@@ -451,12 +386,11 @@ def webhook():
             "giver": "admin_gift",
             "receiver": target,
             "vote": -1,
-            "reason": f"Админ выдал {amount}-",
             "created_at": datetime.now(tz).isoformat()
         })
         update_user_rep(target, 0, amount)
-        plus, minus, _ = get_user_rep(target)
-        send_msg(chat_id, f"✅ Выдано {amount} минусов пользователю @{target}\n👍 {plus} | 👎 {minus}")
+        plus, minus = get_user_rep(target)
+        send_msg(chat_id, f"✅ Выдано {amount} минусов @{target}\n👍 {plus} | 👎 {minus}")
     
     # ========== СБРОС ЛИМИТОВ ==========
     elif text == "/reset_limits":
@@ -479,17 +413,12 @@ def webhook():
             for u in users:
                 writer.writerow([u["username"], u["plus_count"], u["minus_count"], u["plus_count"] - u["minus_count"]])
             output.seek(0)
-                        # Отправляем файлом через Telegram
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
             files = {"document": ("reputation.csv", output.getvalue().encode())}
             data = {"chat_id": chat_id}
             requests.post(url, files=files, data=data)
         else:
             send_msg(chat_id, "❌ Нет данных")
-    
-    # ========== АПЕЛЛЯЦИЯ (только ответ на -реп) ==========
-    elif text in ["/ap", "/ап"]:
-        send_msg(chat_id, "📝 Функция апелляции в разработке. Пока можно обжаловать минус лично админу.")
     
     # ========== БЛОКИРОВКА ССЫЛОК ==========
     else:
